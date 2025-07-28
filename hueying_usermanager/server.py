@@ -10,7 +10,10 @@ import json
 import inspect
 import argparse
 import requests
-from datetime import datetime
+import redis
+from flask_session import Session
+from datetime import datetime, timedelta
+import time
 from io import BytesIO
 from functools import wraps
 
@@ -35,6 +38,12 @@ APPLICATIONS_FILE = os.path.join(BASE_DIR, 'applications.json') # 审批数据�
 # Flask应用初始化及密钥设置
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'huiying-secret')  # 用户身份码，生产环境请设置环境变量
+
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/1')
+app.config['SESSION_TYPE'] = 'redis'
+app.config['SESSION_REDIS'] = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+Session(app)
+app.permanent_session_lifetime = timedelta(days=5)
 
 
 
@@ -257,6 +266,13 @@ def login():
         password = request.form.get('password')
         users = load_users()
         user = users.get(username)
+        fail_key = f"login_fail:{username}"
+        fail_info = app.config['SESSION_REDIS'].hgetall(fail_key)
+        fail_count = int(fail_info.get('count', 0))
+        lock_until = float(fail_info.get('lock_until', 0))
+
+        if lock_until and time.time() < lock_until:
+            return render_template('login.html', error='密码错误5次，24小时内不可继续登录')
         if user and user.get('password') == password:
             # 登录成功，记录登录时间和来源IP
             client_ip = get_client_ip()
@@ -265,14 +281,24 @@ def login():
             user['location'] = get_location_from_ip(client_ip)
             users[username] = user
             save_users(users)
+            app.config['SESSION_REDIS'].delete(fail_key)
             if user.get('is_admin'):
+                session.permanent = True
                 session['admin'] = username
                 return redirect(url_for('user_list'))
             if user.get('is_agent'):
+                session.permanent = True
                 session['agent'] = username
                 return redirect(url_for('agent_users'))
         # 登录失败
-        return render_template('login.html', error='登录失败')
+        fail_count += 1
+        mapping = {'count': fail_count}
+        if fail_count >= 5:
+            mapping['lock_until'] = time.time() + 24 * 3600
+        app.config['SESSION_REDIS'].hset(fail_key, mapping)
+        app.config['SESSION_REDIS'].expire(fail_key, 24 * 3600)
+        msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
+        return render_template('login.html', error=msg)
     return render_template('login.html')
 
 

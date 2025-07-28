@@ -9,6 +9,6 @@ gevent-websocket==0.10.1
 pillow==10.4.0
 python-engineio==4.7.1
 eventlet==0.33.3
-
-
+redis==5.0.4
+Flask-Session==0.5.0
 openpyxl==3.1.2
