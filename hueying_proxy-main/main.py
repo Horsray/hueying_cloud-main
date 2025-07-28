@@ -20,6 +20,7 @@ from threading import Thread, Lock
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from collections import defaultdict, deque
+import redis
 
 # Adjust path to import shared utilities
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -30,30 +31,37 @@ from db_utils import init_db, load_users, save_users, db_lock
 logging.getLogger("geventwebsocket").setLevel(logging.ERROR)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
 
-# 用户认证与状态缓存路径
-SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
-sessions = {}
+# 会话持久化改为 Redis
 init_db()
-
-# 会话持久化
 session_lock = Lock()
 
-def load_sessions():
-    if os.path.exists(SESSIONS_FILE):
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+def get_session(token: str):
+    data = redis_client.hget("sessions", token)
+    if data:
         try:
-            with open(SESSIONS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            return json.loads(data)
         except Exception:
-            return {}
-    return {}
+            return None
+    return None
 
-def save_sessions(data):
-    with session_lock:
-        with open(SESSIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+def set_session(token: str, data: dict):
+    redis_client.hset("sessions", token, json.dumps(data, ensure_ascii=False))
 
-# 初始化会话数据
-sessions.update(load_sessions())
+def delete_session(token: str):
+    redis_client.hdel("sessions", token)
+
+def all_sessions() -> dict:
+    raw = redis_client.hgetall("sessions")
+    result = {}
+    for k, v in raw.items():
+        try:
+            result[k] = json.loads(v)
+        except Exception:
+            continue
+    return result
 
 # 云端接口地址
 
@@ -1033,7 +1041,8 @@ def huiying_commit():
                 }
             }
             token = request.headers.get('Authorization', '').replace('Bearer ', '')
-            username = sessions.get(token, {}).get("username")
+            session_info = get_session(token) or {}
+            username = session_info.get("username")
             logger.info(f"✅ 操作用户 {username}")
             #logger.info(f"  → prompt_id: {prompt_id}")
             #logger.info(f"  → 节点总数: {total_nodes}")
@@ -1113,13 +1122,13 @@ def check_online():
 
     # 从缓存中查找用户名
     def get_username_from_token(token):
-        session = sessions.get(token)
-        if isinstance(session, dict):
-            return session.get("username")
-        return session
+        session_info = get_session(token)
+        if isinstance(session_info, dict):
+            return session_info.get("username")
+        return session_info
 
     token = get_token_from_request(request)#token定义
-    current = sessions.get(token)#本地活跃token
+    current = get_session(token)#本地活跃token
     username = get_username_from_token(token)#本地用户获取
     # 🧩 本地无用户，转发到云端验证
     if not username:
@@ -1152,13 +1161,13 @@ def check_online():
 
     # ✅ 如果是本地不活跃用户，直接下线
     if username:
-        current = sessions.get(token)
+        current = get_session(token)
         if not current:
             return jsonify({"code": 401, "msg": "未检测到活跃用户，触发重新登录", "data": None})
 
     # ✅ 针对本地用户的多端登录检查
     if username:
-        for t, s in sessions.items():
+        for t, s in all_sessions().items():
             if t == token:
                 continue
             if s.get("username") == username and s.get("login_time", 0) > current.get("login_time", 0):
@@ -1208,13 +1217,21 @@ def login_compatible():
         logger.warning(f"[Login] 用户 {username} 已被禁用")
         return jsonify({"code": 403, "msg": "该账号已被禁用"}), 403
 
+    fail_key = f"login_fail:{username}"
+    fail_info = redis_client.hgetall(fail_key)
+    fail_count = int(fail_info.get("count", 0))
+    lock_until = float(fail_info.get("lock_until", 0))
+
+    if lock_until and time.time() < lock_until:
+        return jsonify({"code": 403, "msg": "密码错误5次，24小时内不可继续登录"}), 403
+
     if user and user_password == password:
         token = uuid.uuid4().hex
-        sessions[token] = {
+        set_session(token, {
             "username": username,
             "login_time": time.time()
-        }
-        save_sessions(sessions)
+        })
+        redis_client.delete(fail_key)
 
         users_data = load_local_users()
         nickname = users_data.get(username, {}).get("nickname", "")
@@ -1245,8 +1262,15 @@ def login_compatible():
         }), 200
 
     if user:
+        fail_count += 1
+        mapping = {"count": fail_count}
+        if fail_count >= 5:
+            mapping["lock_until"] = time.time() + 24 * 3600
+        redis_client.hset(fail_key, mapping)
+        redis_client.expire(fail_key, 24 * 3600)
+        msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
         logger.warning("[Login] 本地密码不匹配")
-        return jsonify({"code": 401, "msg": "用户名或密码错误"}), 401
+        return jsonify({"code": 401, "msg": msg}), 401
     else:
         logger.info("👤 用户: {username}是lightcc用户，转发登录验证")
 
@@ -1279,8 +1303,8 @@ session.mount("http://", adapter)
 @app.route('/auth/logout', methods=['POST'])
 def logout():
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    session_obj = sessions.pop(token, None)
-    save_sessions(sessions)
+    session_obj = get_session(token)
+    delete_session(token)
     if session_obj:
         username = session_obj.get("username", "")
         nickname = session_obj.get("nickname", "")
@@ -1303,16 +1327,14 @@ def session_cleaner():
         expire_seconds = 5 * 24 * 60 * 60  # 5天
         to_remove = []
 
-        for token, session in list(sessions.items()):
+        for token, session in all_sessions().items():
             login_time = session.get("login_time", 0)
             if now - login_time > expire_seconds:
                 to_remove.append(token)
 
         for token in to_remove:
-            logger.info(f"🧹 清理过期会话: {sessions[token]}")
-            del sessions[token]
-        if to_remove:
-            save_sessions(sessions)
+            logger.info(f"🧹 清理过期会话: {get_session(token)}")
+            delete_session(token)
 
         time.sleep(7200)  # 每2小时检查一次
 
