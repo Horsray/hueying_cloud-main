@@ -16,7 +16,7 @@ import uuid
 import copy
 import logging
 from datetime import datetime, timedelta
-from threading import Thread, Lock
+from threading import Thread, Lock, RLock
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from collections import defaultdict, deque
@@ -33,7 +33,7 @@ logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
 
 # 会话持久化改为 Redis
 init_db()
-session_lock = Lock()
+session_lock = RLock()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -1266,13 +1266,13 @@ def login_compatible():
         mapping = {"count": fail_count}
         if fail_count >= 5:
             mapping["lock_until"] = time.time() + 24 * 3600
-        redis_client.hset(fail_key, mapping)
+        redis_client.hset(fail_key, mapping=mapping)
         redis_client.expire(fail_key, 24 * 3600)
         msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
         logger.warning("[Login] 本地密码不匹配")
         return jsonify({"code": 401, "msg": msg}), 401
     else:
-        logger.info("👤 用户: {username}是lightcc用户，转发登录验证")
+        logger.info(f"👤 用户: {username}是lightcc用户，转发登录验证")
 
     try:
         response = requests.post(
@@ -1307,9 +1307,8 @@ def logout():
     delete_session(token)
     if session_obj:
         username = session_obj.get("username", "")
-        nickname = session_obj.get("nickname", "")
-        msg = f"用户 {username}（{nickname}）退出成功"
-        logger.info(f"👋 {msg}")
+        logger.info(f"👤 用户: {username}-退出成功👋")
+
     else:
         msg = "无会话，允许退出"
         logger.info(f"ℹ️ {msg}")
