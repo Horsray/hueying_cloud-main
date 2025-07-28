@@ -41,7 +41,9 @@ app.secret_key = os.environ.get('SECRET_KEY', 'huiying-secret')  # 用户身份�
 
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/1')
 app.config['SESSION_TYPE'] = 'redis'
-app.config['SESSION_REDIS'] = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+# Flask-Session stores pickled binary data, so disable automatic UTF-8 decoding
+# when connecting to Redis or session loading will fail with UnicodeDecodeError
+app.config['SESSION_REDIS'] = redis.Redis.from_url(REDIS_URL, decode_responses=False)
 Session(app)
 app.permanent_session_lifetime = timedelta(days=5)
 
@@ -282,6 +284,8 @@ def login():
         user = users.get(username)
         fail_key = f"login_fail:{username}"
         fail_info = app.config['SESSION_REDIS'].hgetall(fail_key)
+        if fail_info:
+            fail_info = {k.decode(): v.decode() for k, v in fail_info.items()}
         fail_count = int(fail_info.get('count', 0))
         lock_until = float(fail_info.get('lock_until', 0))
 
