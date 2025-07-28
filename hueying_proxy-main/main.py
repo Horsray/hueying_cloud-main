@@ -1266,7 +1266,7 @@ def login_compatible():
         mapping = {"count": fail_count}
         if fail_count >= 5:
             mapping["lock_until"] = time.time() + 24 * 3600
-        redis_client.hset(fail_key, mapping)
+        redis_client.hset(fail_key, mapping=mapping)
         redis_client.expire(fail_key, 24 * 3600)
         msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
         logger.warning("[Login] 本地密码不匹配")
