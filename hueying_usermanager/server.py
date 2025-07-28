@@ -39,11 +39,36 @@ APPLICATIONS_FILE = os.path.join(BASE_DIR, 'applications.json') # 审批数据�
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'huiying-secret')  # 用户身份码，生产环境请设置环境变量
 
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/1')
-app.config['SESSION_TYPE'] = 'redis'
-app.config['SESSION_REDIS'] = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+REDIS_URL = os.getenv('REDIS_URL')
+redis_client = None
+if REDIS_URL:
+    try:
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        app.config['SESSION_TYPE'] = 'redis'
+        app.config['SESSION_REDIS'] = redis_client
+    except Exception as e:
+        print(f"[WARN] Redis unavailable ({e}), falling back to filesystem sessions")
+        app.config['SESSION_TYPE'] = 'filesystem'
+else:
+    app.config['SESSION_TYPE'] = 'filesystem'
+
 Session(app)
 app.permanent_session_lifetime = timedelta(days=5)
+
+if redis_client is None:
+    class SimpleStore(dict):
+        def hgetall(self, key):
+            return self.get(key, {})
+        def hset(self, key, mapping):
+            self[key] = {**self.get(key, {}), **mapping}
+        def expire(self, key, seconds):
+            pass
+        def delete(self, key):
+            self.pop(key, None)
+    app.config['FAIL_STORE'] = SimpleStore()
+else:
+    app.config['FAIL_STORE'] = redis_client
 
 
 
@@ -267,7 +292,8 @@ def login():
         users = load_users()
         user = users.get(username)
         fail_key = f"login_fail:{username}"
-        fail_info = app.config['SESSION_REDIS'].hgetall(fail_key)
+        store = app.config['FAIL_STORE']
+        fail_info = store.hgetall(fail_key)
         fail_count = int(fail_info.get('count', 0))
         lock_until = float(fail_info.get('lock_until', 0))
 
@@ -281,7 +307,7 @@ def login():
             user['location'] = get_location_from_ip(client_ip)
             users[username] = user
             save_users(users)
-            app.config['SESSION_REDIS'].delete(fail_key)
+            store.delete(fail_key)
             if user.get('is_admin'):
                 session.permanent = True
                 session['admin'] = username
@@ -295,8 +321,8 @@ def login():
         mapping = {'count': fail_count}
         if fail_count >= 5:
             mapping['lock_until'] = time.time() + 24 * 3600
-        app.config['SESSION_REDIS'].hset(fail_key, mapping)
-        app.config['SESSION_REDIS'].expire(fail_key, 24 * 3600)
+        store.hset(fail_key, mapping)
+        store.expire(fail_key, 24 * 3600)
         msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
         return render_template('login.html', error=msg)
     return render_template('login.html')

@@ -31,37 +31,93 @@ from db_utils import init_db, load_users, save_users, db_lock
 logging.getLogger("geventwebsocket").setLevel(logging.ERROR)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
 
-# 会话持久化改为 Redis
+# 会话持久化改为 Redis，若不可用则回退到本地文件
 init_db()
 session_lock = Lock()
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client = None
+if REDIS_URL:
+    try:
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+    except Exception as e:
+        print(f"[WARN] Redis unavailable ({e}), falling back to file sessions")
+        redis_client = None
+
+SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
+sessions = {}
+
+def load_sessions():
+    if os.path.exists(SESSIONS_FILE):
+        try:
+            with open(SESSIONS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_sessions(data):
+    with session_lock:
+        with open(SESSIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+if redis_client is None:
+    sessions.update(load_sessions())
+
+    class SimpleStore(dict):
+        def hgetall(self, key):
+            return self.get(key, {})
+        def hset(self, key, mapping):
+            self[key] = {**self.get(key, {}), **mapping}
+        def expire(self, key, seconds):
+            pass
+        def delete(self, key):
+            self.pop(key, None)
+    fail_store = SimpleStore()
+else:
+    fail_store = redis_client
 
 def get_session(token: str):
-    data = redis_client.hget("sessions", token)
-    if data:
-        try:
-            return json.loads(data)
-        except Exception:
-            return None
-    return None
+    if redis_client:
+        data = redis_client.hget("sessions", token)
+        if data:
+            try:
+                return json.loads(data)
+            except Exception:
+                return None
+        return None
+    with session_lock:
+        return sessions.get(token)
 
 def set_session(token: str, data: dict):
-    redis_client.hset("sessions", token, json.dumps(data, ensure_ascii=False))
+    if redis_client:
+        redis_client.hset("sessions", token, json.dumps(data, ensure_ascii=False))
+    else:
+        with session_lock:
+            sessions[token] = data
+            save_sessions(sessions)
 
 def delete_session(token: str):
-    redis_client.hdel("sessions", token)
+    if redis_client:
+        redis_client.hdel("sessions", token)
+    else:
+        with session_lock:
+            sessions.pop(token, None)
+            save_sessions(sessions)
 
 def all_sessions() -> dict:
-    raw = redis_client.hgetall("sessions")
-    result = {}
-    for k, v in raw.items():
-        try:
-            result[k] = json.loads(v)
-        except Exception:
-            continue
-    return result
+    if redis_client:
+        raw = redis_client.hgetall("sessions")
+        result = {}
+        for k, v in raw.items():
+            try:
+                result[k] = json.loads(v)
+            except Exception:
+                continue
+        return result
+    with session_lock:
+        return dict(sessions)
 
 # 云端接口地址
 
@@ -1218,7 +1274,7 @@ def login_compatible():
         return jsonify({"code": 403, "msg": "该账号已被禁用"}), 403
 
     fail_key = f"login_fail:{username}"
-    fail_info = redis_client.hgetall(fail_key)
+    fail_info = fail_store.hgetall(fail_key)
     fail_count = int(fail_info.get("count", 0))
     lock_until = float(fail_info.get("lock_until", 0))
 
@@ -1231,7 +1287,7 @@ def login_compatible():
             "username": username,
             "login_time": time.time()
         })
-        redis_client.delete(fail_key)
+        fail_store.delete(fail_key)
 
         users_data = load_local_users()
         nickname = users_data.get(username, {}).get("nickname", "")
@@ -1266,8 +1322,8 @@ def login_compatible():
         mapping = {"count": fail_count}
         if fail_count >= 5:
             mapping["lock_until"] = time.time() + 24 * 3600
-        redis_client.hset(fail_key, mapping)
-        redis_client.expire(fail_key, 24 * 3600)
+        fail_store.hset(fail_key, mapping)
+        fail_store.expire(fail_key, 24 * 3600)
         msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
         logger.warning("[Login] 本地密码不匹配")
         return jsonify({"code": 401, "msg": msg}), 401
