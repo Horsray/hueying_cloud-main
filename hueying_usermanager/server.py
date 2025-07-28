@@ -40,10 +40,25 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'huiying-secret')  # 用户身份码，生产环境请设置环境变量
 
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/1')
+# Use Redis connection pool for higher concurrency and lower latency
+redis_pool = redis.ConnectionPool.from_url(REDIS_URL, decode_responses=False, max_connections=100)
 app.config['SESSION_TYPE'] = 'redis'
-app.config['SESSION_REDIS'] = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+app.config['SESSION_REDIS'] = redis.Redis(connection_pool=redis_pool)
 Session(app)
 app.permanent_session_lifetime = timedelta(days=5)
+
+# Patch Flask-Session to avoid rare save_session bug
+from flask_session.sessions import RedisSessionInterface
+if isinstance(app.session_interface, RedisSessionInterface):
+    class SafeRedisSessionInterface(RedisSessionInterface):
+        def save_session(self, app, session, response):
+            if session is None:
+                return
+            super().save_session(app, session, response)
+    iface = app.session_interface
+    app.session_interface = SafeRedisSessionInterface(
+        iface.redis, iface.key_prefix, iface.use_signer, iface.permanent
+    )
 
 
 
@@ -268,6 +283,8 @@ def login():
         user = users.get(username)
         fail_key = f"login_fail:{username}"
         fail_info = app.config['SESSION_REDIS'].hgetall(fail_key)
+        if fail_info:
+            fail_info = {k.decode(): v.decode() for k, v in fail_info.items()}
         fail_count = int(fail_info.get('count', 0))
         lock_until = float(fail_info.get('lock_until', 0))
 
@@ -295,7 +312,7 @@ def login():
         mapping = {'count': fail_count}
         if fail_count >= 5:
             mapping['lock_until'] = time.time() + 24 * 3600
-        app.config['SESSION_REDIS'].hset(fail_key, mapping)
+        app.config['SESSION_REDIS'].hset(fail_key, mapping=mapping)
         app.config['SESSION_REDIS'].expire(fail_key, 24 * 3600)
         msg = f"密码错误{fail_count}次" + ("，24小时内不可继续登录" if fail_count >= 5 else "")
         return render_template('login.html', error=msg)
