@@ -45,6 +45,20 @@ app.config['SESSION_REDIS'] = redis.Redis.from_url(REDIS_URL, decode_responses=T
 Session(app)
 app.permanent_session_lifetime = timedelta(days=5)
 
+from flask_session.sessions import RedisSessionInterface
+
+if isinstance(app.session_interface, RedisSessionInterface):
+    class SafeRedisSessionInterface(RedisSessionInterface):
+        def save_session(self, app, session, response):
+            if session is None:
+                return
+            super().save_session(app, session, response)
+
+    iface = app.session_interface
+    app.session_interface = SafeRedisSessionInterface(
+        iface.redis, iface.key_prefix, iface.use_signer, iface.permanent
+    )
+
 
 
 

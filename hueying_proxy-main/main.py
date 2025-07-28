@@ -16,7 +16,7 @@ import uuid
 import copy
 import logging
 from datetime import datetime, timedelta
-from threading import Thread, Lock
+from threading import Thread, Lock, RLock
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from collections import defaultdict, deque
@@ -33,7 +33,7 @@ logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
 
 # 会话持久化改为 Redis
 init_db()
-session_lock = Lock()
+session_lock = RLock()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -1272,7 +1272,7 @@ def login_compatible():
         logger.warning("[Login] 本地密码不匹配")
         return jsonify({"code": 401, "msg": msg}), 401
     else:
-        logger.info("👤 用户: {username}是lightcc用户，转发登录验证")
+        logger.info(f"👤 用户: {username}是lightcc用户，转发登录验证")
 
     try:
         response = requests.post(
